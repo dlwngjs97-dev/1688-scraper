@@ -236,26 +236,27 @@ app.get('/scrape', async (req, res) => {
 
     const data = await page.evaluate(EXTRACT_PRODUCT)
 
-    // include_images=true → 브라우저 내에서 이미지를 base64로 다운로드
+    // include_images=true → Playwright context.request로 이미지 다운로드 (브라우저 쿠키/세션 공유)
     const includeImages = req.query.include_images === 'true'
     let imageData = []
     if (includeImages && data.images.length > 0) {
-      imageData = await page.evaluate(async (imgUrls) => {
-        const results = []
-        for (const imgUrl of imgUrls.slice(0, 6)) {
-          try {
-            const r = await fetch(imgUrl)
-            if (!r.ok) { results.push({ url: imgUrl, success: false }); continue }
-            const blob = await r.blob()
-            const buffer = await blob.arrayBuffer()
-            const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)))
-            results.push({ url: imgUrl, success: true, base64, contentType: r.headers.get('content-type') || 'image/jpeg', size: buffer.byteLength })
-          } catch {
-            results.push({ url: imgUrl, success: false })
-          }
+      for (const imgUrl of data.images.slice(0, 6)) {
+        try {
+          const resp = await context.request.get(imgUrl)
+          if (!resp.ok()) { imageData.push({ url: imgUrl, success: false, error: `${resp.status()}` }); continue }
+          const buffer = await resp.body()
+          if (buffer.length < 3000) { imageData.push({ url: imgUrl, success: false, error: 'too small' }); continue }
+          imageData.push({
+            url: imgUrl,
+            success: true,
+            base64: buffer.toString('base64'),
+            contentType: resp.headers()['content-type'] || 'image/jpeg',
+            size: buffer.length,
+          })
+        } catch (e) {
+          imageData.push({ url: imgUrl, success: false, error: e.message })
         }
-        return results
-      }, data.images)
+      }
     }
 
     await browser.close()
