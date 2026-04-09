@@ -1,0 +1,15 @@
+{
+  "name": "1688-scraper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx playwright install chromium --with-deps || true"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "playwright": "^1.42.0"
+  }
+}
