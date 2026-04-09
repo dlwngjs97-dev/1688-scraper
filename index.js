@@ -112,6 +112,72 @@ const EXTRACT_PRODUCT = () => {
   return result
 }
 
+// 1688 이미지 프록시 — 브라우저 세션으로 이미지 다운로드 후 바이너리 반환
+// GET /image-proxy?url=https://cbu01.alicdn.com/img/ibank/xxx.jpg_.webp
+app.get('/image-proxy', async (req, res) => {
+  if (req.headers['x-proxy-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  const imageUrl = req.query.url
+  if (!imageUrl || !imageUrl.includes('alicdn.com')) {
+    return res.status(400).json({ error: 'alicdn.com image url required' })
+  }
+
+  try {
+    // 브라우저 없이 직접 fetch — alicdn은 Referer만 맞으면 됨
+    const response = await fetch(imageUrl, {
+      headers: {
+        'Referer': 'https://detail.1688.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    })
+    if (!response.ok) {
+      return res.status(response.status).json({ error: `upstream ${response.status}` })
+    }
+    const buffer = Buffer.from(await response.arrayBuffer())
+    const contentType = response.headers.get('content-type') || 'image/jpeg'
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Content-Length', buffer.length)
+    res.send(buffer)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /download-images — 이미지 URL 배열 → base64 배열 반환
+// 1688 이미지를 SmartStore에 업로드하기 위해 이 서버에서 다운로드
+app.post('/download-images', async (req, res) => {
+  if (req.headers['x-proxy-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  const urls = req.body.urls
+  if (!Array.isArray(urls)) {
+    return res.status(400).json({ error: 'urls array required' })
+  }
+
+  const results = await Promise.all(urls.slice(0, 10).map(async (url) => {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'Referer': 'https://detail.1688.com/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        },
+      })
+      if (!response.ok) return { url, success: false, error: `${response.status}` }
+      const buffer = Buffer.from(await response.arrayBuffer())
+      if (buffer.length < 5000) return { url, success: false, error: 'too small' }
+      const contentType = response.headers.get('content-type') || 'image/jpeg'
+      return { url, success: true, base64: buffer.toString('base64'), contentType, size: buffer.length }
+    } catch (err) {
+      return { url, success: false, error: err.message }
+    }
+  }))
+
+  res.json({ results })
+})
+
 app.get('/health', (_, res) => res.json({ ok: true, service: '1688-scraper' }))
 
 app.get('/my-ip', async (_, res) => {
