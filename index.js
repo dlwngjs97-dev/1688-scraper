@@ -236,27 +236,43 @@ app.get('/scrape', async (req, res) => {
 
     const data = await page.evaluate(EXTRACT_PRODUCT)
 
-    // include_images=true → Playwright context.request로 이미지 다운로드 (브라우저 쿠키/세션 공유)
+    // include_images=true → 렌더링된 img 요소를 canvas로 추출해서 base64 반환
     const includeImages = req.query.include_images === 'true'
     let imageData = []
     if (includeImages && data.images.length > 0) {
-      for (const imgUrl of data.images.slice(0, 6)) {
-        try {
-          const resp = await context.request.get(imgUrl)
-          if (!resp.ok()) { imageData.push({ url: imgUrl, success: false, error: `${resp.status()}` }); continue }
-          const buffer = await resp.body()
-          if (buffer.length < 3000) { imageData.push({ url: imgUrl, success: false, error: 'too small' }); continue }
-          imageData.push({
-            url: imgUrl,
-            success: true,
-            base64: buffer.toString('base64'),
-            contentType: resp.headers()['content-type'] || 'image/jpeg',
-            size: buffer.length,
-          })
-        } catch (e) {
-          imageData.push({ url: imgUrl, success: false, error: e.message })
+      imageData = await page.evaluate(async (imgUrls) => {
+        const results = []
+        // DOM에서 모든 img 요소 수집
+        const allImgs = Array.from(document.querySelectorAll('img'))
+
+        for (const targetUrl of imgUrls.slice(0, 6)) {
+          try {
+            // src가 매칭되는 img 찾기
+            const img = allImgs.find(i => i.src === targetUrl || i.src.includes(targetUrl.split('/').pop().split('.')[0]))
+            if (!img || !img.complete || img.naturalWidth === 0) {
+              results.push({ url: targetUrl, success: false, error: 'img not loaded' })
+              continue
+            }
+            const canvas = document.createElement('canvas')
+            canvas.width = img.naturalWidth
+            canvas.height = img.naturalHeight
+            const ctx = canvas.getContext('2d')
+            ctx.drawImage(img, 0, 0)
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
+            const base64 = dataUrl.split(',')[1]
+            results.push({
+              url: targetUrl,
+              success: true,
+              base64,
+              contentType: 'image/jpeg',
+              size: Math.round(base64.length * 0.75), // approx decoded size
+            })
+          } catch (e) {
+            results.push({ url: targetUrl, success: false, error: String(e) })
+          }
         }
-      }
+        return results
+      }, data.images)
     }
 
     await browser.close()
