@@ -235,6 +235,29 @@ app.get('/scrape', async (req, res) => {
     await page.waitForTimeout(4000)
 
     const data = await page.evaluate(EXTRACT_PRODUCT)
+
+    // include_images=true → 브라우저 내에서 이미지를 base64로 다운로드
+    const includeImages = req.query.include_images === 'true'
+    let imageData = []
+    if (includeImages && data.images.length > 0) {
+      imageData = await page.evaluate(async (imgUrls) => {
+        const results = []
+        for (const imgUrl of imgUrls.slice(0, 6)) {
+          try {
+            const r = await fetch(imgUrl)
+            if (!r.ok) { results.push({ url: imgUrl, success: false }); continue }
+            const blob = await r.blob()
+            const buffer = await blob.arrayBuffer()
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)))
+            results.push({ url: imgUrl, success: true, base64, contentType: r.headers.get('content-type') || 'image/jpeg', size: buffer.byteLength })
+          } catch {
+            results.push({ url: imgUrl, success: false })
+          }
+        }
+        return results
+      }, data.images)
+    }
+
     await browser.close()
     busy = false
 
@@ -246,7 +269,7 @@ app.get('/scrape', async (req, res) => {
       })
     }
 
-    res.json({ success: true, data })
+    res.json({ success: true, data, ...(includeImages ? { imageData } : {}) })
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {})
