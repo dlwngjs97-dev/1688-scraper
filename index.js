@@ -213,6 +213,25 @@ app.get('/scrape', async (req, res) => {
     const context = await browser.newContext(CONTEXT_OPTS)
     const page = await context.newPage()
 
+    // 네트워크 인터셉션으로 이미지 응답 캡처
+    const capturedImages = new Map() // url → Buffer
+    if (req.query.include_images === 'true') {
+      page.on('response', async (response) => {
+        try {
+          const respUrl = response.url()
+          if (respUrl.includes('cbu01.alicdn.com/img/ibank/') && response.status() === 200) {
+            const ct = response.headers()['content-type'] || ''
+            if (ct.startsWith('image/') || respUrl.match(/\.(jpg|png|webp)/i)) {
+              const body = await response.body()
+              if (body.length > 3000) {
+                capturedImages.set(respUrl, { buffer: body, contentType: ct || 'image/jpeg' })
+              }
+            }
+          }
+        } catch {} // 일부 응답은 body 접근 불가 — 무시
+      })
+    }
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
 
     // punish/wrongpage 체크
@@ -236,43 +255,33 @@ app.get('/scrape', async (req, res) => {
 
     const data = await page.evaluate(EXTRACT_PRODUCT)
 
-    // include_images=true → 렌더링된 img 요소를 canvas로 추출해서 base64 반환
+    // include_images=true → 네트워크 인터셉션으로 캡처한 이미지 반환
     const includeImages = req.query.include_images === 'true'
     let imageData = []
-    if (includeImages && data.images.length > 0) {
-      imageData = await page.evaluate(async (imgUrls) => {
-        const results = []
-        // DOM에서 모든 img 요소 수집
-        const allImgs = Array.from(document.querySelectorAll('img'))
-
-        for (const targetUrl of imgUrls.slice(0, 6)) {
-          try {
-            // src가 매칭되는 img 찾기
-            const img = allImgs.find(i => i.src === targetUrl || i.src.includes(targetUrl.split('/').pop().split('.')[0]))
-            if (!img || !img.complete || img.naturalWidth === 0) {
-              results.push({ url: targetUrl, success: false, error: 'img not loaded' })
-              continue
-            }
-            const canvas = document.createElement('canvas')
-            canvas.width = img.naturalWidth
-            canvas.height = img.naturalHeight
-            const ctx = canvas.getContext('2d')
-            ctx.drawImage(img, 0, 0)
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
-            const base64 = dataUrl.split(',')[1]
-            results.push({
-              url: targetUrl,
-              success: true,
-              base64,
-              contentType: 'image/jpeg',
-              size: Math.round(base64.length * 0.75), // approx decoded size
-            })
-          } catch (e) {
-            results.push({ url: targetUrl, success: false, error: String(e) })
+    if (includeImages) {
+      // 캡처된 이미지 중 data.images URL과 매칭되는 것 찾기
+      for (const imgUrl of data.images.slice(0, 6)) {
+        // URL 패턴으로 매칭 (캡처 URL은 정확히 같거나 suffix만 다를 수 있음)
+        const imgId = imgUrl.split('/').pop()?.split('.')[0] || ''
+        let matched = capturedImages.get(imgUrl)
+        if (!matched) {
+          // 부분 매칭
+          for (const [capturedUrl, capturedData] of capturedImages) {
+            if (capturedUrl.includes(imgId)) { matched = capturedData; break }
           }
         }
-        return results
-      }, data.images)
+        if (matched) {
+          imageData.push({
+            url: imgUrl,
+            success: true,
+            base64: matched.buffer.toString('base64'),
+            contentType: matched.contentType,
+            size: matched.buffer.length,
+          })
+        } else {
+          imageData.push({ url: imgUrl, success: false, error: 'not captured during page load' })
+        }
+      }
     }
 
     await browser.close()
