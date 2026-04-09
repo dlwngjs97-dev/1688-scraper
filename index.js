@@ -12,6 +12,106 @@ const SECRET = process.env.PROXY_SECRET || ''
 // 동시성 1로 제한 (512MB RAM 보호)
 let busy = false
 
+const BROWSER_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--single-process',
+  '--no-zygote',
+]
+
+const CONTEXT_OPTS = {
+  locale: 'zh-CN',
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+}
+
+// 상품 정보 추출 함수 (page.evaluate에서 실행)
+const EXTRACT_PRODUCT = () => {
+  const result = {
+    title: '',
+    titleCn: '',
+    priceCny: null,
+    priceRange: '',
+    moq: '',
+    images: [],
+    shop: '',
+    shopUrl: '',
+    attributes: {},
+    url: window.location.href,
+  }
+
+  // 상품명 (d-title 첫 줄 = 영문/중문 상품명)
+  const dTitle = document.querySelector('[class*="d-title"]')
+  if (dTitle) {
+    const lines = dTitle.innerText.trim().split('\n')
+    result.title = lines[0] || ''
+    // 중문명은 보통 두 번째 줄이거나 title 안에 포함
+  }
+  if (!result.title) {
+    const h1 = document.querySelector('h1')
+    if (h1) result.title = h1.innerText.trim().split('\n')[0]
+  }
+
+  // 가격 — price-info가 가장 깔끔
+  const priceInfo = document.querySelector('.price-info')
+  if (priceInfo) {
+    const nums = priceInfo.innerText.match(/[\d.]+/g)
+    if (nums && nums.length > 0) {
+      result.priceCny = parseFloat(nums.join(''))
+    }
+  }
+  // 폴백: module-od-main-price
+  if (!result.priceCny) {
+    const mainPrice = document.querySelector('[class*="module-od-main-price"]')
+    if (mainPrice) {
+      const nums = mainPrice.innerText.match(/[\d.]+/g)
+      if (nums) result.priceCny = parseFloat(nums.join(''))
+    }
+  }
+
+  // 가격 범위 (계량 할인 래더)
+  const ladderEls = document.querySelectorAll('[class*="step-price"], [class*="ladder-price"], [class*="sku-price-item"]')
+  if (ladderEls.length > 0) {
+    result.priceRange = Array.from(ladderEls).map(el => el.innerText.trim()).filter(t => t.length < 80).join(' | ')
+  }
+
+  // MOQ — 텍스트에서 "起批", "件起批" 패턴
+  const bodyText = document.body.innerText
+  const moqMatch = bodyText.match(/(\d+)\s*件?\s*起批/) || bodyText.match(/≥\s*(\d+)\s*件/)
+  if (moqMatch) result.moq = moqMatch[0]
+
+  // 이미지 — cbu01.alicdn.com 상품 이미지만 (SVG 아이콘 제외)
+  const imgs = document.querySelectorAll('img')
+  result.images = Array.from(imgs)
+    .map(i => i.src || i.getAttribute('data-src') || '')
+    .filter(s => s.includes('cbu01.alicdn.com/img/ibank/'))
+    .map(s => s.replace(/_.+?\.(jpg|png|webp)/, '.$1')) // 썸네일 suffix 제거 → 원본
+    .filter((v, i, a) => a.indexOf(v) === i) // dedup
+    .slice(0, 10)
+
+  // 상점명
+  const shopEl = document.querySelector('[class*="company-name"]') || document.querySelector('[class*="companyName"]')
+  if (shopEl) result.shop = shopEl.innerText.trim()
+
+  // 상점 링크
+  const shopLink = document.querySelector('a[href*="shop"][class*="company"]') || document.querySelector('a[href*=".1688.com"]')
+  if (shopLink) result.shopUrl = shopLink.href
+
+  // 속성 테이블
+  const attrRows = document.querySelectorAll('[class*="attr"] tr, [class*="attribute"] tr, [class*="detail-attributes"] tr')
+  attrRows.forEach(row => {
+    const cells = row.querySelectorAll('td, th, span')
+    if (cells.length >= 2) {
+      const key = cells[0].innerText.trim()
+      const val = cells[1].innerText.trim()
+      if (key && val && key.length < 30) result.attributes[key] = val
+    }
+  })
+
+  return result
+}
+
 app.get('/health', (_, res) => res.json({ ok: true, service: '1688-scraper' }))
 
 app.get('/my-ip', async (_, res) => {
@@ -43,109 +143,39 @@ app.get('/scrape', async (req, res) => {
   let browser = null
 
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
-      ],
-    })
-
-    const context = await browser.newContext({
-      locale: 'zh-CN',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    })
-
+    browser = await chromium.launch({ headless: true, args: BROWSER_ARGS })
+    const context = await browser.newContext(CONTEXT_OPTS)
     const page = await context.newPage()
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
 
-    // punish 리다이렉트 감지 — 3초 대기 후 재시도
-    const currentUrl = page.url()
-    if (currentUrl.includes('punish') || currentUrl.includes('x5secdata')) {
-      // 실제 브라우저면 자동으로 원래 페이지로 돌아감. 잠시 대기.
+    // punish/wrongpage 체크
+    const loadedUrl = page.url()
+    if (loadedUrl.includes('punish') || loadedUrl.includes('x5secdata')) {
       await page.waitForTimeout(5000)
       if (page.url().includes('punish')) {
         await browser.close()
         busy = false
-        return res.status(403).json({ error: 'anti-bot challenge not bypassed', finalUrl: page.url() })
+        return res.status(403).json({ error: 'anti-bot challenge not bypassed' })
       }
     }
+    if (loadedUrl.includes('wrongpage') || loadedUrl.includes('notfound')) {
+      await browser.close()
+      busy = false
+      return res.status(404).json({ error: 'product not found (removed or invalid URL)' })
+    }
 
-    // 페이지 로드 대기
-    await page.waitForTimeout(3000)
+    // 페이지 렌더링 대기
+    await page.waitForTimeout(4000)
 
-    // 상품 정보 추출
-    const data = await page.evaluate(() => {
-      const result = {
-        title: '',
-        price: '',
-        priceRange: '',
-        minOrder: '',
-        images: [],
-        attributes: {},
-        shop: '',
-        url: window.location.href,
-      }
-
-      // 상품명
-      const titleEl = document.querySelector('.title-text') ||
-        document.querySelector('[class*="title"]') ||
-        document.querySelector('h1')
-      if (titleEl) result.title = titleEl.innerText.trim()
-
-      // 가격
-      const priceEl = document.querySelector('.price-text') ||
-        document.querySelector('[class*="price"]') ||
-        document.querySelector('.num')
-      if (priceEl) result.price = priceEl.innerText.trim()
-
-      // 가격 범위 (계량 할인)
-      const priceItems = document.querySelectorAll('[class*="price-item"], [class*="step-price"]')
-      if (priceItems.length > 0) {
-        result.priceRange = Array.from(priceItems).map(el => el.innerText.trim()).join(' | ')
-      }
-
-      // 최소주문량
-      const moqEl = document.querySelector('[class*="min-order"]') ||
-        document.querySelector('[class*="起批"]')
-      if (moqEl) result.minOrder = moqEl.innerText.trim()
-
-      // 이미지 (상위 10개)
-      const imgs = document.querySelectorAll('[class*="detail-gallery"] img, [class*="image-view"] img, .detail-gallery-turn img')
-      result.images = Array.from(imgs).slice(0, 10).map(img =>
-        (img.src || img.getAttribute('data-src') || '').replace(/_.+?\.jpg/, '.jpg')
-      ).filter(Boolean)
-
-      // 상점명
-      const shopEl = document.querySelector('[class*="company-name"]') ||
-        document.querySelector('.shop-name')
-      if (shopEl) result.shop = shopEl.innerText.trim()
-
-      // 속성
-      const attrRows = document.querySelectorAll('[class*="attr"] tr, [class*="attribute"] tr')
-      attrRows.forEach(row => {
-        const cells = row.querySelectorAll('td, th')
-        if (cells.length >= 2) {
-          result.attributes[cells[0].innerText.trim()] = cells[1].innerText.trim()
-        }
-      })
-
-      return result
-    })
-
+    const data = await page.evaluate(EXTRACT_PRODUCT)
     await browser.close()
     busy = false
 
-    // 빈 응답 체크
     if (!data.title && data.images.length === 0) {
       return res.json({
         success: false,
-        error: 'page loaded but no product data found (layout may have changed)',
-        rawUrl: currentUrl,
+        error: 'page loaded but no product data extracted',
         data,
       })
     }
@@ -159,7 +189,7 @@ app.get('/scrape', async (req, res) => {
   }
 })
 
-// 다중 상품 벌크 스크래핑 (최대 5개)
+// 다중 상품 벌크 스크래핑 (최대 5개, 브라우저 1개로 순차)
 app.post('/scrape-bulk', async (req, res) => {
   if (req.headers['x-proxy-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' })
@@ -169,11 +199,9 @@ app.post('/scrape-bulk', async (req, res) => {
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ error: 'urls array required' })
   }
-
   if (urls.length > 5) {
     return res.status(400).json({ error: 'max 5 urls per request' })
   }
-
   if (busy) {
     return res.status(429).json({ error: 'busy, try again in 30s' })
   }
@@ -183,30 +211,16 @@ app.post('/scrape-bulk', async (req, res) => {
   const results = []
 
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
-      ],
-    })
-
-    const context = await browser.newContext({
-      locale: 'zh-CN',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    })
+    browser = await chromium.launch({ headless: true, args: BROWSER_ARGS })
+    const context = await browser.newContext(CONTEXT_OPTS)
 
     for (const url of urls) {
       try {
         const page = await context.newPage()
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 })
 
-        const currentUrl = page.url()
-        if (currentUrl.includes('punish')) {
+        const loadedUrl = page.url()
+        if (loadedUrl.includes('punish')) {
           await page.waitForTimeout(5000)
           if (page.url().includes('punish')) {
             results.push({ url, success: false, error: 'anti-bot' })
@@ -214,27 +228,19 @@ app.post('/scrape-bulk', async (req, res) => {
             continue
           }
         }
+        if (loadedUrl.includes('wrongpage') || loadedUrl.includes('notfound')) {
+          results.push({ url, success: false, error: 'product not found' })
+          await page.close()
+          continue
+        }
 
-        await page.waitForTimeout(2000)
-
-        const data = await page.evaluate(() => {
-          const r = { title: '', price: '', minOrder: '', images: [], shop: '' }
-          const t = document.querySelector('.title-text') || document.querySelector('[class*="title"]') || document.querySelector('h1')
-          if (t) r.title = t.innerText.trim()
-          const p = document.querySelector('.price-text') || document.querySelector('[class*="price"]') || document.querySelector('.num')
-          if (p) r.price = p.innerText.trim()
-          const imgs = document.querySelectorAll('[class*="detail-gallery"] img, [class*="image-view"] img')
-          r.images = Array.from(imgs).slice(0, 5).map(i => (i.src || i.getAttribute('data-src') || '').replace(/_.+?\.jpg/, '.jpg')).filter(Boolean)
-          const s = document.querySelector('[class*="company-name"]') || document.querySelector('.shop-name')
-          if (s) r.shop = s.innerText.trim()
-          return r
-        })
-
+        await page.waitForTimeout(3000)
+        const data = await page.evaluate(EXTRACT_PRODUCT)
         results.push({ url, success: !!data.title, data })
         await page.close()
 
       } catch (err) {
-        results.push({ url, success: false, error: err.message })
+        results.push({ url, success: false, error: err.message.substring(0, 200) })
       }
     }
 
